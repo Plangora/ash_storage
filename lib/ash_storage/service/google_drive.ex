@@ -30,6 +30,9 @@ if Code.ensure_loaded?(Req) do
       `AshStorage.Service.Disk` does it
     - `:folder_id` - a Drive folder id to create files under. Defaults to the
       Shared Drive's root
+    - `:key_property` - `:app_properties` (default) or `:properties`. Where
+      the AshStorage key is stored on the Drive file — both are invisible in
+      the Drive UI; see "Keys, names, and Drive ids" below for the tradeoff
     - `:goth` - the name of an already-running `Goth` server to fetch bearer
       tokens from. Persisted on blob records (it is a reference, not a
       secret) so operations that start from a stored row — purge, analysis,
@@ -95,9 +98,10 @@ if Code.ensure_loaded?(Req) do
     Drive is often chosen specifically so a person can browse it directly if
     the app is unavailable, and a pile of opaque generated keys defeats that.
     Instead, `upload/3` sets `name` to the human filename from `ctx.filename`
-    (falling back to the key only when a caller invokes this service's
-    `upload/3` directly, bypassing `AshStorage.Operations` — every framework
-    upload path sets `ctx.filename`) and stores the key in
+    (falling back to the key only when no filename is known — currently true
+    of variant uploads; `AshStorage.VariantGenerator` doesn't set `:filename`
+    on the context it builds, unlike `attach/4` and `handle_file_argument.ex`,
+    a pre-existing framework gap upstream of this service) and stores the key in
     `appProperties["ash_storage_key"]`, custom metadata invisible in the
     Drive UI. The Drive id is resolved by looking up that property
     (`files.list` filtered by an exact `appProperties has {...}` match, plus
@@ -107,24 +111,37 @@ if Code.ensure_loaded?(Req) do
 
     Two things worth knowing about this choice:
 
-    - **`appProperties` is private to the requesting app** — readable only
+    - **Where the key lives is a visibility/recoverability tradeoff, and
+      it's configurable via `:key_property`.** The default,
+      `:app_properties`, is private to the requesting app — readable only
       through an access token from the same OAuth client / service account
       that wrote it. Rotating to a new Google Cloud project or service
       account makes every existing file's key invisible to the new
-      credentials: lookups return "not found," re-uploading to an
-      old key creates a duplicate instead of updating, and every subsequent
-      lookup for that key permanently returns `{:error, {:ambiguous_key, _, _}}`.
-      If some other tool ever needs to read the key back outside this
-      application, use `properties` instead (equally invisible in the Drive
-      UI, but visible to any authenticated caller) by adjusting
-      `build_create_session_request/5`.
+      credentials: lookups return "not found," re-uploading to an old key
+      creates a duplicate instead of updating, and every subsequent lookup
+      for that key permanently returns `{:error, {:ambiguous_key, _, _}}` —
+      silent and compounding, not a loud failure you'd notice right away.
+      Set `key_property: :properties` instead to trade that away: still
+      invisible in the Drive UI (Drive doesn't render custom properties of
+      either kind), but readable by any authenticated caller with access to
+      the file — recoverable if your credentials ever change, at the cost of
+      the key being incidentally visible to anything else with file access
+      (which, holding a Shared Drive access grant, could already read the
+      file's actual contents — the key was never the sensitive part).
+      `:app_properties` is the default because it matches the common case
+      ("nothing outside this app should read this"); an application storing
+      years of files under credentials that might someday need to rotate
+      should weigh that against the recoverability `:properties` buys.
     - **Drive caps a property at 124 bytes of key + value, UTF-8-encoded.**
-      With `"ash_storage_key"` (15 bytes) as the key, that leaves 109 bytes
-      for the AshStorage key itself. The default generated key (56 hex
-      chars) and the default tenant-prefixed form both fit with room to
-      spare, but a custom `path` function (`AshStorage.resolve_key/3`) can
-      return anything — keep it under 109 bytes when this service is
-      configured.
+      With `"ash_storage_key"` (15 bytes) as the property key, that leaves
+      109 bytes for the AshStorage key value itself, regardless of which
+      `:key_property` you choose. The default generated key (56 hex chars)
+      and the default tenant-prefixed form both fit with room to spare, but
+      a custom `path` function (`AshStorage.resolve_key/3`) can return
+      anything — `upload/3` checks the length itself and returns
+      `{:error, {:key_too_long, byte_size, 109}}` before making any request
+      if it's over, rather than surfacing whatever error Drive would return
+      for an oversized property.
 
     `upload/3` caches the resolved id in `:drive_file_id` on the blob
     record, so most calls that start from a blob (`download/2`,
@@ -215,15 +232,21 @@ if Code.ensure_loaded?(Req) do
     @default_api_base_url "https://www.googleapis.com/drive/v3"
     @default_upload_base_url "https://www.googleapis.com/upload/drive/v3"
 
-    # The appProperties key the AshStorage key is stored under. Custom app
-    # metadata, not the file's display name -- see build_create_session_request/5.
+    # The custom-metadata key the AshStorage key is stored under (within
+    # whichever of appProperties/properties :key_property selects). Not the
+    # file's display name -- see build_create_session_request/5.
     @key_property "ash_storage_key"
+
+    # Drive caps a custom property at 124 bytes of key + value combined,
+    # UTF-8-encoded (see the "Keys, names, and Drive ids" moduledoc section).
+    @max_key_bytes 124 - byte_size(@key_property)
 
     @impl true
     def service_opts_fields do
       [
         shared_drive_id: [type: :string, allow_nil?: false],
         folder_id: [type: :string],
+        key_property: [type: :atom],
         goth: [type: :atom],
         drive_file_id: [type: :string],
         api_base_url: [type: :string],
@@ -236,13 +259,16 @@ if Code.ensure_loaded?(Req) do
     def upload(key, io, %Context{} = ctx) do
       {body, size} = body_and_length(io)
       mime = ctx.content_type || "application/octet-stream"
-      # attach/4, handle_file_argument.ex, and variant generation all set
-      # ctx.filename before calling upload/3. The fallback to the key only
-      # matters for a caller invoking this service's upload/3 directly,
-      # bypassing AshStorage.Operations entirely.
+      # Falls back to the key when no human filename is known (currently
+      # true of variant uploads -- AshStorage.VariantGenerator doesn't set
+      # :filename on the context it builds, unlike attach/4 and
+      # handle_file_argument.ex). An opaque name there is a pre-existing
+      # framework gap, not something to paper over silently here -- fixed
+      # separately, not as part of this PR.
       name = ctx.filename || key
 
-      with {:ok, token} <- resolve_token(ctx.service_opts),
+      with :ok <- validate_key_length(key),
+           {:ok, token} <- resolve_token(ctx.service_opts),
            {:ok, existing_id} <- lookup_id(key, token, ctx.service_opts),
            {:ok, session_url} <-
              start_resumable_session(token, key, name, mime, size, existing_id, ctx.service_opts),
@@ -273,6 +299,34 @@ if Code.ensure_loaded?(Req) do
       |> Keyword.put(:drive_file_id, drive_file_id)
       |> Map.new()
     end
+
+    # Fails before making any request rather than letting Drive reject the
+    # property with whatever error it returns for an oversized one.
+    defp validate_key_length(key) do
+      size = byte_size(key)
+
+      if size <= @max_key_bytes do
+        :ok
+      else
+        {:error, {:key_too_long, size, @max_key_bytes}}
+      end
+    end
+
+    # :app_properties (default) keeps the key invisible in the Drive UI but
+    # readable only by the app/credentials that wrote it -- rotating
+    # projects or service accounts makes existing keys unresolvable.
+    # :properties is equally invisible in the UI but readable by any
+    # authenticated caller with access to the file, trading that visibility
+    # for recoverability. See the "Keys, names, and Drive ids" moduledoc
+    # section.
+    defp key_property_atom(opts) do
+      case Keyword.get(opts, :key_property, :app_properties) do
+        :app_properties -> :appProperties
+        :properties -> :properties
+      end
+    end
+
+    defp key_property_query_name(opts), do: key_property_atom(opts) |> Atom.to_string()
 
     @impl true
     def download(key, %Context{} = ctx) do
@@ -626,10 +680,10 @@ if Code.ensure_loaded?(Req) do
           {"x-upload-content-length", Integer.to_string(size)}
         ],
         json: %{
+          key_property_atom(opts) => %{@key_property => key},
           name: name,
           mimeType: mime,
-          parents: [Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)],
-          appProperties: %{@key_property => key}
+          parents: [Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)]
         }
       ]
     end
@@ -676,8 +730,9 @@ if Code.ensure_loaded?(Req) do
 
     defp lookup_query(key, opts) do
       parent = Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)
+      property = key_property_query_name(opts)
 
-      "appProperties has { key='#{@key_property}' and value='#{escape_q(key)}' } " <>
+      "#{property} has { key='#{@key_property}' and value='#{escape_q(key)}' } " <>
         "and '#{escape_q(parent)}' in parents and trashed = false"
     end
 

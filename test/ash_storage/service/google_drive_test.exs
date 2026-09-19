@@ -111,6 +111,27 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert headers["x-upload-content-type"] == "text/plain"
       assert headers["x-upload-content-length"] == "11"
     end
+
+    test "stores the key under :appProperties by default" do
+      request =
+        Drive.build_create_session_request("key-abc123", "notes.txt", "text/plain", 11,
+          shared_drive_id: @shared_drive_id
+        )
+
+      assert request[:json][:appProperties] == %{"ash_storage_key" => "key-abc123"}
+      refute Map.has_key?(request[:json], :properties)
+    end
+
+    test "stores the key under :properties when :key_property is :properties" do
+      request =
+        Drive.build_create_session_request("key-abc123", "notes.txt", "text/plain", 11,
+          shared_drive_id: @shared_drive_id,
+          key_property: :properties
+        )
+
+      assert request[:json][:properties] == %{"ash_storage_key" => "key-abc123"}
+      refute Map.has_key?(request[:json], :appProperties)
+    end
   end
 
   describe "build_update_session_request/4" do
@@ -246,6 +267,30 @@ defmodule AshStorage.Service.GoogleDriveTest do
     end
   end
 
+  describe "build_lookup_request/2 and :key_property" do
+    test "queries appProperties by default" do
+      request = Drive.build_lookup_request("key-1", shared_drive_id: @shared_drive_id)
+      assert request[:params][:q] =~ "appProperties has { key='ash_storage_key'"
+    end
+
+    test "queries properties when :key_property is :properties" do
+      request =
+        Drive.build_lookup_request("key-1",
+          shared_drive_id: @shared_drive_id,
+          key_property: :properties
+        )
+
+      assert request[:params][:q] =~ "properties has { key='ash_storage_key'"
+      refute request[:params][:q] =~ "appProperties"
+    end
+  end
+
+  describe "service_opts_fields/0 and :key_property" do
+    test "declares :key_property" do
+      assert Keyword.has_key?(Drive.service_opts_fields(), :key_property)
+    end
+  end
+
   # -- Mock Google Drive server --
   #
   # A hand-rolled HTTP/1.1 server over :gen_tcp, following the same pattern
@@ -306,6 +351,48 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert :ok = Drive.delete(key, ctx_with_id)
       assert {:ok, false} = Drive.exists?(key, ctx_with_id)
       assert {:error, :not_found} = Drive.download(key, ctx_with_id)
+    end
+
+    test "an oversized key fails fast, without making any request", %{
+      ctx: ctx,
+      server_state: server_state
+    } do
+      # 110 bytes -- one over the 109-byte limit left by the 15-byte
+      # "ash_storage_key" property name inside Drive's 124-byte cap.
+      oversized_key = String.duplicate("a", 110)
+
+      assert {:error, {:key_too_long, 110, 109}} = Drive.upload(oversized_key, "data", ctx)
+      assert recorded_requests(server_state) == []
+    end
+
+    test "a 109-byte key is accepted", %{ctx: ctx} do
+      key = String.duplicate("a", 109)
+      assert {:ok, _} = Drive.upload(key, "data", ctx)
+    end
+
+    test "key_property: :properties round-trips through upload -> exists? -> download", %{
+      ctx: ctx,
+      server_state: server_state
+    } do
+      props_ctx = %{ctx | service_opts: Keyword.put(ctx.service_opts, :key_property, :properties)}
+      key = unique_key()
+
+      assert {:ok, %{service_opts: opts}} = Drive.upload(key, "properties mode", props_ctx)
+      id = opts[:drive_file_id]
+
+      object = Agent.get(server_state, fn state -> Map.fetch!(state.objects, id) end)
+      assert Map.get(object.app_properties, "ash_storage_key") == key
+
+      ctx_with_id = %{
+        props_ctx
+        | service_opts: Keyword.merge(props_ctx.service_opts, Map.to_list(opts))
+      }
+
+      assert {:ok, true} = Drive.exists?(key, ctx_with_id)
+      assert {:ok, "properties mode"} = Drive.download(key, ctx_with_id)
+
+      # And a lookup with no cached id, still in :properties mode, resolves too.
+      assert {:ok, true} = Drive.exists?(key, props_ctx)
     end
 
     test "the Drive file's display name is the human filename, not the opaque key", %{
@@ -817,7 +904,8 @@ defmodule AshStorage.Service.GoogleDriveTest do
                 object = %{
                   name: Map.fetch!(metadata, "name"),
                   parents: Map.fetch!(metadata, "parents"),
-                  app_properties: Map.get(metadata, "appProperties", %{}),
+                  app_properties:
+                    Map.get(metadata, "appProperties") || Map.get(metadata, "properties") || %{},
                   mime_type: mime,
                   body: body,
                   md5: md5,
@@ -881,7 +969,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
 
   defp extract_q_app_property(q, property_key) do
     pattern =
-      ~r/appProperties has \{ key='#{Regex.escape(property_key)}' and value='((?:[^'\\]|\\.)*)' \}/
+      ~r/(?:appProperties|properties) has \{ key='#{Regex.escape(property_key)}' and value='((?:[^'\\]|\\.)*)' \}/
 
     case Regex.run(pattern, q) do
       [_, value] -> unescape_q(value)
