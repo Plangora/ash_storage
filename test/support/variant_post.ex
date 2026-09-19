@@ -46,8 +46,7 @@ defmodule AshStorage.Test.VariantPost do
   use Ash.Resource,
     domain: AshStorage.Test.Domain,
     data_layer: Ash.DataLayer.Ets,
-    extensions: [AshStorage],
-    otp_app: :ash_storage
+    extensions: [AshStorage]
 
   ets do
     private? true
