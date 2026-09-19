@@ -46,7 +46,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
   describe "request builders carry supportsAllDrives: true" do
     test "every builder carries it" do
       requests = [
-        Drive.build_create_session_request("key", "text/plain", 5,
+        Drive.build_create_session_request("key", "photo.jpg", "text/plain", 5,
           shared_drive_id: @shared_drive_id
         ),
         Drive.build_update_session_request("id-1", "text/plain", 5,
@@ -72,10 +72,10 @@ defmodule AshStorage.Service.GoogleDriveTest do
     end
   end
 
-  describe "build_create_session_request/4" do
+  describe "build_create_session_request/5" do
     test "targets the resumable upload endpoint with the metadata" do
       request =
-        Drive.build_create_session_request("notes.txt", "text/plain", 11,
+        Drive.build_create_session_request("key-abc123", "notes.txt", "text/plain", 11,
           shared_drive_id: @shared_drive_id
         )
 
@@ -86,13 +86,14 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert request[:json] == %{
                name: "notes.txt",
                mimeType: "text/plain",
-               parents: [@shared_drive_id]
+               parents: [@shared_drive_id],
+               appProperties: %{"ash_storage_key" => "key-abc123"}
              }
     end
 
     test "a configured :folder_id is used as the parent instead of the Shared Drive id" do
       request =
-        Drive.build_create_session_request("notes.txt", "text/plain", 11,
+        Drive.build_create_session_request("key-abc123", "notes.txt", "text/plain", 11,
           shared_drive_id: @shared_drive_id,
           folder_id: "folder-1"
         )
@@ -102,7 +103,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
 
     test "carries the size and content type as upload headers" do
       request =
-        Drive.build_create_session_request("notes.txt", "text/plain", 11,
+        Drive.build_create_session_request("key-abc123", "notes.txt", "text/plain", 11,
           shared_drive_id: @shared_drive_id
         )
 
@@ -113,7 +114,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
   end
 
   describe "build_update_session_request/4" do
-    test "targets the file by id and omits :parents and :name" do
+    test "targets the file by id and omits :parents, :name, and :appProperties" do
       request =
         Drive.build_update_session_request("id-1", "text/plain", 11,
           shared_drive_id: @shared_drive_id
@@ -124,6 +125,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert request[:params][:uploadType] == "resumable"
       refute Map.has_key?(request[:json], :parents)
       refute Map.has_key?(request[:json], :name)
+      refute Map.has_key?(request[:json], :appProperties)
     end
   end
 
@@ -306,6 +308,44 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert {:error, :not_found} = Drive.download(key, ctx_with_id)
     end
 
+    test "the Drive file's display name is the human filename, not the opaque key", %{
+      ctx: ctx,
+      server_state: server_state
+    } do
+      key = unique_key()
+      named_ctx = %{ctx | filename: "vacation-photo.jpg"}
+
+      assert {:ok, %{service_opts: opts}} = Drive.upload(key, "photo bytes", named_ctx)
+      id = opts[:drive_file_id]
+
+      object = Agent.get(server_state, fn state -> Map.fetch!(state.objects, id) end)
+      assert object.name == "vacation-photo.jpg"
+      assert Map.get(object.app_properties, "ash_storage_key") == key
+
+      # The key, not the display name, is still what resolves the id -- a
+      # human renaming the file in the Drive UI (simulated here) must not
+      # break lookup.
+      Agent.update(server_state, fn state ->
+        put_in(state, [:objects, id, :name], "renamed-by-a-human.jpg")
+      end)
+
+      ctx_without_id = ctx
+      assert {:ok, true} = Drive.exists?(key, ctx_without_id)
+    end
+
+    test "upload/3 falls back to the key as the display name when ctx.filename is unset", %{
+      ctx: ctx,
+      server_state: server_state
+    } do
+      key = unique_key()
+      assert {:ok, %{service_opts: opts}} = Drive.upload(key, "no filename given", ctx)
+
+      object =
+        Agent.get(server_state, fn state -> Map.fetch!(state.objects, opts[:drive_file_id]) end)
+
+      assert object.name == key
+    end
+
     test "the session-start POST carries only JSON metadata; the PUT to the session URL carries the file bytes",
          %{ctx: ctx, server_state: server_state} do
       key = unique_key()
@@ -435,7 +475,11 @@ defmodule AshStorage.Service.GoogleDriveTest do
       # own update-on-reupload behavior, to simulate the race this design
       # guards against.
       Agent.update(server_state, fn state ->
-        {id, obj} = Enum.find(state.objects, fn {_id, o} -> o.name == key end)
+        {id, obj} =
+          Enum.find(state.objects, fn {_id, o} ->
+            Map.get(o.app_properties, "ash_storage_key") == key
+          end)
+
         duplicate_id = "dup-#{id}"
         %{state | objects: Map.put(state.objects, duplicate_id, obj)}
       end)
@@ -773,6 +817,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
                 object = %{
                   name: Map.fetch!(metadata, "name"),
                   parents: Map.fetch!(metadata, "parents"),
+                  app_properties: Map.get(metadata, "appProperties", %{}),
                   mime_type: mime,
                   body: body,
                   md5: md5,
@@ -810,14 +855,14 @@ defmodule AshStorage.Service.GoogleDriveTest do
 
   defp list_files(server_state, query) do
     q = query["q"] || ""
-    name = extract_q_field(q, "name")
+    key = extract_q_app_property(q, "ash_storage_key")
     parent = extract_q_field(q, "parent")
 
     files =
       Agent.get(server_state, fn state ->
         state.objects
         |> Enum.filter(fn {_id, object} ->
-          object.name == name and not object.trashed and
+          Map.get(object.app_properties, "ash_storage_key") == key and not object.trashed and
             (is_nil(parent) or parent in object.parents)
         end)
         |> Enum.map(fn {id, object} ->
@@ -834,8 +879,11 @@ defmodule AshStorage.Service.GoogleDriveTest do
     {200, Jason.encode!(%{"files" => files}), [{"content-type", "application/json"}]}
   end
 
-  defp extract_q_field(q, "name") do
-    case Regex.run(~r/name = '((?:[^'\\]|\\.)*)'/, q) do
+  defp extract_q_app_property(q, property_key) do
+    pattern =
+      ~r/appProperties has \{ key='#{Regex.escape(property_key)}' and value='((?:[^'\\]|\\.)*)' \}/
+
+    case Regex.run(pattern, q) do
       [_, value] -> unescape_q(value)
       _ -> nil
     end

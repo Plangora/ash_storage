@@ -336,6 +336,12 @@ upload fails as though credentials were wrong. `:goth` names an already-running
 `https://www.googleapis.com/auth/drive`; a raw `:access_token` is also
 accepted per-call for callers that don't use Goth.
 
+AshStorage's generated attachment key never becomes the Drive file's display
+name — a Shared Drive is often chosen specifically so a person can browse it
+directly, and a pile of opaque keys would defeat that. The key lives in
+`appProperties` (invisible in the Drive UI) instead; the file's `name` is the
+human filename passed to `attach/4`.
+
 Drive file URLs are not access-controlled, so `url/2` only returns something
 useful when `:base_url` is configured to point at your own proxy (see
 [Streaming downloads](#streaming-downloads) and `AshStorage.Plug.Proxy`) —

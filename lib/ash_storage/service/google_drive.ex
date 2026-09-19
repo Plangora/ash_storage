@@ -91,9 +91,40 @@ if Code.ensure_loaded?(Req) do
 
     `AshStorage` generates the `key` before calling any service — Drive
     assigns file ids server-side, so the two can't be the same value. This
-    service stores the `key` as the Drive file's `name` and resolves the
-    Drive id by lookup (`files.list` filtered by `name` and parent) when it
-    isn't already known.
+    service does **not** put the key in the Drive file's `name`: a Shared
+    Drive is often chosen specifically so a person can browse it directly if
+    the app is unavailable, and a pile of opaque generated keys defeats that.
+    Instead, `upload/3` sets `name` to the human filename from `ctx.filename`
+    (falling back to the key only when a caller invokes this service's
+    `upload/3` directly, bypassing `AshStorage.Operations` — every framework
+    upload path sets `ctx.filename`) and stores the key in
+    `appProperties["ash_storage_key"]`, custom metadata invisible in the
+    Drive UI. The Drive id is resolved by looking up that property
+    (`files.list` filtered by an exact `appProperties has {...}` match, plus
+    parent) when it isn't already known — an exact match on custom metadata,
+    not the fuzzier territory of matching against a display name Drive may
+    normalize or a user may rename by hand.
+
+    Two things worth knowing about this choice:
+
+    - **`appProperties` is private to the requesting app** — readable only
+      through an access token from the same OAuth client / service account
+      that wrote it. Rotating to a new Google Cloud project or service
+      account makes every existing file's key invisible to the new
+      credentials: lookups return "not found," re-uploading to an
+      old key creates a duplicate instead of updating, and every subsequent
+      lookup for that key permanently returns `{:error, {:ambiguous_key, _, _}}`.
+      If some other tool ever needs to read the key back outside this
+      application, use `properties` instead (equally invisible in the Drive
+      UI, but visible to any authenticated caller) by adjusting
+      `build_create_session_request/5`.
+    - **Drive caps a property at 124 bytes of key + value, UTF-8-encoded.**
+      With `"ash_storage_key"` (15 bytes) as the key, that leaves 109 bytes
+      for the AshStorage key itself. The default generated key (56 hex
+      chars) and the default tenant-prefixed form both fit with room to
+      spare, but a custom `path` function (`AshStorage.resolve_key/3`) can
+      return anything — keep it under 109 bytes when this service is
+      configured.
 
     `upload/3` caches the resolved id in `:drive_file_id` on the blob
     record, so most calls that start from a blob (`download/2`,
@@ -104,9 +135,23 @@ if Code.ensure_loaded?(Req) do
 
     Re-uploading to an existing key **updates** that file rather than
     creating a duplicate (an extra lookup, to match every other bundled
-    service's overwrite-by-key behavior). More than one file sharing a name
-    is treated as an error — `{:error, {:ambiguous_key, key, ids}}` — rather
-    than picked from arbitrarily.
+    service's overwrite-by-key behavior) — the update does not touch `name`
+    or `appProperties` (omitting a field from a Drive update leaves it
+    unchanged, it does not clear it), only the content, so a file a human
+    has since renamed in the Drive UI stays renamed. More than one file
+    sharing a key is treated as an error —
+    `{:error, {:ambiguous_key, key, ids}}` — rather than picked from
+    arbitrarily.
+
+    Drive's `files.list` search is index-backed and only eventually
+    consistent — a lookup immediately after a create can occasionally miss,
+    which `upload/3` would read as "no existing file" and take the create
+    branch, permanently poisoning that key with an `:ambiguous_key` error
+    once the index catches up and a second file with the same property
+    exists. This is inherent to searching Drive by metadata rather than
+    addressing by id, and isn't specific to using `appProperties` over
+    `name` — an `:drive_file_id` cached on the blob record avoids it for
+    that record going forward.
 
     ## URLs are not access control
 
@@ -170,6 +215,10 @@ if Code.ensure_loaded?(Req) do
     @default_api_base_url "https://www.googleapis.com/drive/v3"
     @default_upload_base_url "https://www.googleapis.com/upload/drive/v3"
 
+    # The appProperties key the AshStorage key is stored under. Custom app
+    # metadata, not the file's display name -- see build_create_session_request/5.
+    @key_property "ash_storage_key"
+
     @impl true
     def service_opts_fields do
       [
@@ -187,11 +236,16 @@ if Code.ensure_loaded?(Req) do
     def upload(key, io, %Context{} = ctx) do
       {body, size} = body_and_length(io)
       mime = ctx.content_type || "application/octet-stream"
+      # attach/4, handle_file_argument.ex, and variant generation all set
+      # ctx.filename before calling upload/3. The fallback to the key only
+      # matters for a caller invoking this service's upload/3 directly,
+      # bypassing AshStorage.Operations entirely.
+      name = ctx.filename || key
 
       with {:ok, token} <- resolve_token(ctx.service_opts),
            {:ok, existing_id} <- lookup_id(key, token, ctx.service_opts),
            {:ok, session_url} <-
-             start_resumable_session(token, key, mime, size, existing_id, ctx.service_opts),
+             start_resumable_session(token, key, name, mime, size, existing_id, ctx.service_opts),
            {:ok, body_map} <-
              token |> put_bytes(session_url, body, size, mime) |> decoded_map(),
            # Drive has no upload-time Content-MD5 equivalent, but the
@@ -297,7 +351,7 @@ if Code.ensure_loaded?(Req) do
       opts = ctx.service_opts
 
       with {:ok, token} <- resolve_token(opts) do
-        # A fresh name lookup already filters trashed = false, so a hit
+        # A fresh property lookup already filters trashed = false, so a hit
         # there needs no further check. A cached id might be stale (the
         # file could have been deleted on Drive out of band since it was
         # cached), so that path still verifies against the API by id.
@@ -455,13 +509,13 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    # Prefers the cached id over a name lookup wherever one is available.
-    # This matters beyond avoiding an extra request: once a blob record is
-    # destroyed, its cached :drive_file_id is the only handle left on the
-    # Drive file. delete/2 and exists?/2 used to always re-resolve by name,
-    # which meant a lookup that came back empty for any transient reason
-    # (index lag, a parent mismatch) made a purge report success without
-    # actually deleting anything on Drive.
+    # Prefers the cached id over a property lookup wherever one is
+    # available. This matters beyond avoiding an extra request: once a blob
+    # record is destroyed, its cached :drive_file_id is the only handle left
+    # on the Drive file. delete/2 and exists?/2 used to always re-resolve by
+    # lookup, which meant a lookup that came back empty for any transient
+    # reason (index lag, a parent mismatch) made a purge report success
+    # without actually deleting anything on Drive.
     defp resolve_id(key, token, opts) do
       case Keyword.get(opts, :drive_file_id) do
         nil -> lookup_id(key, token, opts)
@@ -507,10 +561,10 @@ if Code.ensure_loaded?(Req) do
     # success, carries no useful body but a `location` header with the
     # session URL the actual bytes get PUT to next. Kept separate from
     # handle_response/1 because a caller needs a header here, not a body.
-    defp start_resumable_session(token, key, mime, size, existing_id, opts) do
+    defp start_resumable_session(token, key, name, mime, size, existing_id, opts) do
       request =
         case existing_id do
-          nil -> build_create_session_request(key, mime, size, opts)
+          nil -> build_create_session_request(key, name, mime, size, opts)
           id -> build_update_session_request(id, mime, size, opts)
         end
 
@@ -526,7 +580,7 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    # Streams the bytes to the session URL from start_resumable_session/6.
+    # Streams the bytes to the session URL from start_resumable_session/7.
     # For an in-memory binary/iolist, `data` is sent as-is -- it's already
     # fully materialized (AshStorage.Operations.attach/4 reads the whole
     # upload before calling any service), so writing it to a temp file just
@@ -552,8 +606,13 @@ if Code.ensure_loaded?(Req) do
 
     # -- Request builders --
 
+    # `name` is the human-readable filename -- it's what a person browsing
+    # the Shared Drive sees, and it plays no role in id resolution. The
+    # AshStorage key goes in `appProperties` instead, under @key_property,
+    # so the Shared Drive stays navigable by a person even though the key
+    # itself is an opaque generated string.
     @doc false
-    def build_create_session_request(key, mime, size, opts) do
+    def build_create_session_request(key, name, mime, size, opts) do
       [
         method: :post,
         url: upload_base(opts) <> "/files",
@@ -567,15 +626,19 @@ if Code.ensure_loaded?(Req) do
           {"x-upload-content-length", Integer.to_string(size)}
         ],
         json: %{
-          name: key,
+          name: name,
           mimeType: mime,
-          parents: [Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)]
+          parents: [Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)],
+          appProperties: %{@key_property => key}
         }
       ]
     end
 
-    # An update must not resend :parents (illegal on a PATCH) or :name
-    # (would rename the file, and the key hasn't changed).
+    # An update must not resend :parents (illegal on a PATCH) or :name (the
+    # display name is a human's to change -- a re-upload must not clobber a
+    # rename made in the Drive UI). :appProperties is likewise omitted:
+    # Drive's update semantics leave unspecified fields unchanged rather
+    # than clearing them, so the key stored there survives untouched.
     @doc false
     def build_update_session_request(id, mime, size, opts) do
       [
@@ -613,7 +676,9 @@ if Code.ensure_loaded?(Req) do
 
     defp lookup_query(key, opts) do
       parent = Keyword.get(opts, :folder_id) || Keyword.fetch!(opts, :shared_drive_id)
-      "name = '#{escape_q(key)}' and '#{escape_q(parent)}' in parents and trashed = false"
+
+      "appProperties has { key='#{@key_property}' and value='#{escape_q(key)}' } " <>
+        "and '#{escape_q(parent)}' in parents and trashed = false"
     end
 
     defp escape_q(value) do
