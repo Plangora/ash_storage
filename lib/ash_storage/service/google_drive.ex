@@ -19,6 +19,15 @@ if Code.ensure_loaded?(Req) do
     ## Options
 
     - `:shared_drive_id` - (required) the id of the Shared Drive to store files on
+    - `:base_url` - (required in practice for `url/2`) proxy this points at,
+      e.g. your own `AshStorage.Plug.Proxy` route. The built-in URL
+      calculations (`url`, `attachment_url`, `attachment_urls`, `variant_url`,
+      `variant_urls`) all build their context from resource-level
+      configuration, which never carries a cached `:drive_file_id` — so
+      without `:base_url`, `url/2` raises on every one of them. See
+      "URLs are not access control" below
+    - `:secret` - secret key for signed URLs under `:base_url`, as
+      `AshStorage.Service.Disk` does it
     - `:folder_id` - a Drive folder id to create files under. Defaults to the
       Shared Drive's root
     - `:goth` - the name of an already-running `Goth` server to fetch bearer
@@ -111,24 +120,33 @@ if Code.ensure_loaded?(Req) do
       it instead (optionally HMAC-signed when `:secret` is also set, exactly
       as `AshStorage.Service.Disk` does) — point this at your own
       `AshStorage.Plug.Proxy` or controller, so your application's policy
-      decides who gets the bytes. This is the intended configuration.
-    - Without `:base_url`, and with a cached or resolvable `:drive_file_id`,
-      `url/2` returns `https://drive.google.com/file/d/\#{id}/view` as a
-      fallback so the callback is honest rather than silent. **This is not
-      an access-controlled URL** — do not put it in front of end users.
-    - Without `:base_url` and with no resolvable id, `url/2` raises
-      `ArgumentError` rather than returning something useless.
+      decides who gets the bytes. **This is the only configuration the
+      built-in URL calculations work with.**
+    - Without `:base_url`, `url/2` never makes a network call to find
+      something to link to (a per-record Drive lookup from a list query
+      would be an accidental N+1) — it only ever returns
+      `https://drive.google.com/file/d/\#{id}/view` when the context you
+      built already carries a `:drive_file_id`, which only happens for a
+      context assembled from a blob record by hand. The built-in URL
+      calculations (`url`, `attachment_url`, `attachment_urls`, `variant_url`,
+      `variant_urls`) build their context from resource-level configuration,
+      never a blob record, so this fallback is unreachable from any of
+      them — they raise `ArgumentError` instead, same as with no `:base_url`
+      and no id at all. **This is not an access-controlled URL** even when
+      it is reachable — do not put it in front of end users.
 
     ## Limits
 
-    - `direct_upload/2` is not implemented. Drive has no clean client-side
-      signed-upload scheme for a service-account-backed adapter without
-      delegating OAuth to the browser, and there is no way to persist a
-      Drive id discovered after the fact (`AshStorage.Operations.prepare_direct_upload/3`
-      creates the blob record before calling the service, and its return
-      value is never merged back onto the row). `AshStorage.Operations.prepare_direct_upload/3`
-      is therefore not available for Drive-backed attachments — upload
-      through `attach/4` or call `upload/3` directly.
+    - `direct_upload/2` always returns `{:error, :direct_upload_not_supported}`.
+      Drive has no clean client-side signed-upload scheme for a
+      service-account-backed adapter without delegating OAuth to the
+      browser, and there is no way to persist a Drive id discovered after
+      the fact (`AshStorage.Operations.prepare_direct_upload/3` creates the
+      blob record before calling the service, and its return value is never
+      merged back onto the row — a pre-existing gap in `Operations` that
+      also means the blob record from a failed `prepare_direct_upload/3`
+      call is not automatically cleaned up). Upload through `attach/4`, or
+      call `upload/3` directly.
     - `stream_download/2` returns a `Req.Response.Async`. It must be
       consumed in the same process that called `stream_download/2` — unlike
       `AshStorage.Service.Disk`'s `File.Stream`, it cannot be handed to
@@ -174,7 +192,17 @@ if Code.ensure_loaded?(Req) do
            {:ok, existing_id} <- lookup_id(key, token, ctx.service_opts),
            {:ok, session_url} <-
              start_resumable_session(token, key, mime, size, existing_id, ctx.service_opts),
-           {:ok, body_map} <- put_bytes(token, session_url, body, size, mime) do
+           {:ok, body_map} <-
+             token |> put_bytes(session_url, body, size, mime) |> decoded_map(),
+           # Drive has no upload-time Content-MD5 equivalent, but the
+           # completion response is a file resource -- the `fields` param on
+           # the initiate request carries through the session URL to it, so
+           # this is verified for free once the bytes are already up.
+           :ok <-
+             verify_remote_md5(
+               hex_to_base64_md5(Map.get(body_map, "md5Checksum")),
+               ctx.expected_md5
+             ) do
         {:ok, %{service_opts: persisted_opts(ctx.service_opts, Map.fetch!(body_map, "id"))}}
       end
     end
@@ -199,8 +227,8 @@ if Code.ensure_loaded?(Req) do
       with {:ok, token} <- resolve_token(ctx.service_opts),
            {:ok, id} <- require_id(key, token, ctx.service_opts),
            {:ok, body} <-
-             key
-             |> build_download_request(id, ctx.service_opts)
+             id
+             |> build_download_request(ctx.service_opts)
              |> Keyword.merge(decode_body: decode_body?)
              |> perform(token)
              |> handle_response(),
@@ -214,9 +242,15 @@ if Code.ensure_loaded?(Req) do
       with {:ok, token} <- resolve_token(ctx.service_opts),
            {:ok, id} <- require_id(key, token, ctx.service_opts) do
         request =
-          key
-          |> build_download_request(id, ctx.service_opts)
-          |> Keyword.merge(auth: {:bearer, token}, into: :self)
+          id
+          |> build_download_request(ctx.service_opts)
+          # retry: false -- Req's retry step doesn't cancel an in-flight
+          # Async response before re-running the request (unlike its
+          # redirect step, which does), so a retried streaming request would
+          # leave the first attempt's chunks sitting in this process's
+          # mailbox under a now-dead ref. Let the caller retry
+          # stream_download/2 itself instead.
+          |> Keyword.merge(auth: {:bearer, token}, into: :self, retry: false)
 
         case Req.request(request) do
           {:ok, %Req.Response{status: status, body: %Req.Response.Async{} = async}}
@@ -240,14 +274,14 @@ if Code.ensure_loaded?(Req) do
     @impl true
     def delete(key, %Context{} = ctx) do
       with {:ok, token} <- resolve_token(ctx.service_opts),
-           {:ok, id_or_nil} <- lookup_id(key, token, ctx.service_opts) do
+           {:ok, id_or_nil} <- resolve_id(key, token, ctx.service_opts) do
         case id_or_nil do
           nil ->
             :ok
 
           id ->
-            case key
-                 |> build_delete_request(id, ctx.service_opts)
+            case id
+                 |> build_delete_request(ctx.service_opts)
                  |> perform(token)
                  |> handle_response() do
               {:ok, _body} -> :ok
@@ -260,11 +294,23 @@ if Code.ensure_loaded?(Req) do
 
     @impl true
     def exists?(key, %Context{} = ctx) do
-      with {:ok, token} <- resolve_token(ctx.service_opts),
-           {:ok, id_or_nil} <- lookup_id(key, token, ctx.service_opts) do
-        case id_or_nil do
-          nil -> {:ok, false}
-          id -> check_still_exists(key, id, token, ctx.service_opts)
+      opts = ctx.service_opts
+
+      with {:ok, token} <- resolve_token(opts) do
+        # A fresh name lookup already filters trashed = false, so a hit
+        # there needs no further check. A cached id might be stale (the
+        # file could have been deleted on Drive out of band since it was
+        # cached), so that path still verifies against the API by id.
+        case Keyword.get(opts, :drive_file_id) do
+          nil ->
+            case lookup_id(key, token, opts) do
+              {:ok, nil} -> {:ok, false}
+              {:ok, _id} -> {:ok, true}
+              {:error, reason} -> {:error, reason}
+            end
+
+          id ->
+            check_still_exists(id, token, opts)
         end
       end
     end
@@ -274,10 +320,11 @@ if Code.ensure_loaded?(Req) do
       with {:ok, token} <- resolve_token(ctx.service_opts),
            {:ok, id} <- require_id(key, token, ctx.service_opts),
            {:ok, body} <-
-             key
-             |> build_metadata_request(id, ctx.service_opts)
+             id
+             |> build_metadata_request(ctx.service_opts)
              |> perform(token)
-             |> handle_response() do
+             |> handle_response()
+             |> decoded_map() do
         {:ok,
          %{
            etag: nil,
@@ -296,6 +343,19 @@ if Code.ensure_loaded?(Req) do
         base_url -> proxied_url(base_url, key, opts)
       end
     end
+
+    @doc """
+    Not supported.
+
+    `AshStorage.Operations.prepare_direct_upload/3` creates the blob record
+    *before* calling this callback and never merges its return value back
+    onto the row, so there would be no way to persist the Drive id a signed
+    upload discovers afterward — the same problem `upload/3`'s
+    `extra_blob_attrs` mechanism solves for the normal attach path doesn't
+    apply here. Upload through `attach/4`, or call `upload/3` directly.
+    """
+    @impl true
+    def direct_upload(_key, %Context{}), do: {:error, :direct_upload_not_supported}
 
     # -- URL helpers --
 
@@ -388,22 +448,34 @@ if Code.ensure_loaded?(Req) do
     # -- Id resolution --
 
     defp require_id(key, token, opts) do
-      case Keyword.get(opts, :drive_file_id) do
-        nil ->
-          case lookup_id(key, token, opts) do
-            {:ok, nil} -> {:error, :not_found}
-            {:ok, id} -> {:ok, id}
-            {:error, reason} -> {:error, reason}
-          end
+      case resolve_id(key, token, opts) do
+        {:ok, nil} -> {:error, :not_found}
+        {:ok, id} -> {:ok, id}
+        {:error, reason} -> {:error, reason}
+      end
+    end
 
-        id ->
-          {:ok, id}
+    # Prefers the cached id over a name lookup wherever one is available.
+    # This matters beyond avoiding an extra request: once a blob record is
+    # destroyed, its cached :drive_file_id is the only handle left on the
+    # Drive file. delete/2 and exists?/2 used to always re-resolve by name,
+    # which meant a lookup that came back empty for any transient reason
+    # (index lag, a parent mismatch) made a purge report success without
+    # actually deleting anything on Drive.
+    defp resolve_id(key, token, opts) do
+      case Keyword.get(opts, :drive_file_id) do
+        nil -> lookup_id(key, token, opts)
+        id -> {:ok, id}
       end
     end
 
     defp lookup_id(key, token, opts) do
       with {:ok, body} <-
-             key |> build_lookup_request(opts) |> perform(token) |> handle_response() do
+             key
+             |> build_lookup_request(opts)
+             |> perform(token)
+             |> handle_response()
+             |> decoded_map() do
         case Map.get(body, "files", []) do
           [] -> {:ok, nil}
           [%{"id" => id}] -> {:ok, id}
@@ -412,7 +484,7 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    defp check_still_exists(_key, id, token, opts) do
+    defp check_still_exists(id, token, opts) do
       case build_exists_request(id, opts) |> perform(token) |> handle_response() do
         {:ok, %{"trashed" => true}} -> {:ok, false}
         {:ok, _body} -> {:ok, true}
@@ -485,7 +557,11 @@ if Code.ensure_loaded?(Req) do
       [
         method: :post,
         url: upload_base(opts) <> "/files",
-        params: %{uploadType: "resumable", supportsAllDrives: true},
+        params: %{
+          uploadType: "resumable",
+          supportsAllDrives: true,
+          fields: "id,md5Checksum,size,mimeType"
+        },
         headers: [
           {"x-upload-content-type", mime},
           {"x-upload-content-length", Integer.to_string(size)}
@@ -505,7 +581,11 @@ if Code.ensure_loaded?(Req) do
       [
         method: :patch,
         url: upload_base(opts) <> "/files/#{id}",
-        params: %{uploadType: "resumable", supportsAllDrives: true},
+        params: %{
+          uploadType: "resumable",
+          supportsAllDrives: true,
+          fields: "id,md5Checksum,size,mimeType"
+        },
         headers: [
           {"x-upload-content-type", mime},
           {"x-upload-content-length", Integer.to_string(size)}
@@ -543,7 +623,7 @@ if Code.ensure_loaded?(Req) do
     end
 
     @doc false
-    def build_download_request(_key, id, opts) do
+    def build_download_request(id, opts) do
       [
         method: :get,
         url: api_base(opts) <> "/files/#{id}",
@@ -552,7 +632,7 @@ if Code.ensure_loaded?(Req) do
     end
 
     @doc false
-    def build_metadata_request(_key, id, opts) do
+    def build_metadata_request(id, opts) do
       [
         method: :get,
         url: api_base(opts) <> "/files/#{id}",
@@ -573,7 +653,7 @@ if Code.ensure_loaded?(Req) do
     end
 
     @doc false
-    def build_delete_request(_key, id, opts) do
+    def build_delete_request(id, opts) do
       [
         method: :delete,
         url: api_base(opts) <> "/files/#{id}",
@@ -606,12 +686,33 @@ if Code.ensure_loaded?(Req) do
 
     def handle_response({:error, reason}), do: {:error, reason}
 
+    # A 2xx body only decodes to a map when Drive (or a fronting proxy on a
+    # bad day) actually sent JSON. Without this, a stray HTML error page or
+    # empty body would raise BadMapError out of Map.get/Map.fetch! deep in a
+    # caller instead of returning a normal {:error, _}.
+    defp decoded_map({:ok, body}) when is_map(body), do: {:ok, body}
+    defp decoded_map({:ok, body}), do: {:error, {:unexpected_response, body}}
+    defp decoded_map({:error, reason}), do: {:error, reason}
+
     defp verify_md5(_data, nil), do: :ok
 
     defp verify_md5(data, expected) do
       if Base.encode64(:erlang.md5(data)) == expected,
         do: :ok,
         else: {:error, :checksum_mismatch}
+    end
+
+    # Compares Drive's server-reported MD5 (already re-encoded to base64,
+    # see hex_to_base64_md5/1) against the caller's expectation, rather than
+    # hashing bytes locally -- the bytes were already streamed up, not held
+    # whole in memory here to hash. `actual: nil` means Drive didn't report
+    # one (Google-native document types only; not a case upload/3 produces),
+    # which is left unverified rather than blocking the upload.
+    defp verify_remote_md5(_actual, nil), do: :ok
+    defp verify_remote_md5(nil, _expected), do: :ok
+
+    defp verify_remote_md5(actual, expected) do
+      if actual == expected, do: :ok, else: {:error, :checksum_mismatch}
     end
 
     # Drive's md5Checksum is lowercase hex; AttachBlob compares against

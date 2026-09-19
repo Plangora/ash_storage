@@ -71,8 +71,8 @@ defmodule AshStorage.Service.GoogleDriveIntegrationTest do
       ctx = %{ctx | service_opts: Keyword.merge(ctx.service_opts, Map.to_list(opts))}
 
       assert {:ok, ^content} = GoogleDrive.download(key, ctx)
-      assert {:ok, %{byte_size: byte_size, content_md5: md5}} = GoogleDrive.head(key, ctx)
-      assert byte_size == byte_size(content)
+      assert {:ok, %{byte_size: size, content_md5: md5}} = GoogleDrive.head(key, ctx)
+      assert size == byte_size(content)
       assert is_binary(md5)
 
       assert :ok = GoogleDrive.delete(key, ctx)
@@ -82,7 +82,7 @@ defmodule AshStorage.Service.GoogleDriveIntegrationTest do
 
   test "a file created with no :folder_id lands under the Shared Drive root", context do
     unless context[:skip] do
-      %{ctx: ctx} = context
+      %{ctx: ctx, shared_drive_id: shared_drive_id} = context
       key = "integration-test-root-#{System.unique_integer([:positive])}"
       assert {:ok, %{service_opts: opts}} = GoogleDrive.upload(key, "root placement check", ctx)
 
@@ -91,7 +91,20 @@ defmodule AshStorage.Service.GoogleDriveIntegrationTest do
         GoogleDrive.delete(key, ctx_with_id)
       end)
 
-      assert opts[:drive_file_id]
+      # Hit the real API directly, independent of GoogleDrive's own code, to
+      # prove the file actually landed where :folder_id's absence claims it
+      # does -- a bug in the module under test shouldn't be able to make
+      # this pass by construction.
+      {:ok, %Goth.Token{token: token}} = Goth.fetch(@goth_name)
+
+      assert {:ok, %Req.Response{status: 200, body: body}} =
+               Req.get(
+                 "https://www.googleapis.com/drive/v3/files/#{opts[:drive_file_id]}",
+                 auth: {:bearer, token},
+                 params: %{fields: "parents", supportsAllDrives: true}
+               )
+
+      assert body["parents"] == [shared_drive_id]
     end
   end
 

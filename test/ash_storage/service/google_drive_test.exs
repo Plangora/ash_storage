@@ -53,10 +53,10 @@ defmodule AshStorage.Service.GoogleDriveTest do
           shared_drive_id: @shared_drive_id
         ),
         Drive.build_lookup_request("key", shared_drive_id: @shared_drive_id),
-        Drive.build_download_request("key", "id-1", shared_drive_id: @shared_drive_id),
-        Drive.build_metadata_request("key", "id-1", shared_drive_id: @shared_drive_id),
+        Drive.build_download_request("id-1", shared_drive_id: @shared_drive_id),
+        Drive.build_metadata_request("id-1", shared_drive_id: @shared_drive_id),
         Drive.build_exists_request("id-1", shared_drive_id: @shared_drive_id),
-        Drive.build_delete_request("key", "id-1", shared_drive_id: @shared_drive_id)
+        Drive.build_delete_request("id-1", shared_drive_id: @shared_drive_id)
       ]
 
       for request <- requests do
@@ -127,9 +127,9 @@ defmodule AshStorage.Service.GoogleDriveTest do
     end
   end
 
-  describe "build_download_request/3" do
+  describe "build_download_request/2" do
     test "targets alt=media" do
-      request = Drive.build_download_request("key", "id-1", shared_drive_id: @shared_drive_id)
+      request = Drive.build_download_request("id-1", shared_drive_id: @shared_drive_id)
 
       assert request[:method] == :get
       assert request[:url] == "https://www.googleapis.com/drive/v3/files/id-1"
@@ -137,9 +137,9 @@ defmodule AshStorage.Service.GoogleDriveTest do
     end
   end
 
-  describe "build_metadata_request/3" do
+  describe "build_metadata_request/2" do
     test "requests explicit fields including md5Checksum" do
-      request = Drive.build_metadata_request("key", "id-1", shared_drive_id: @shared_drive_id)
+      request = Drive.build_metadata_request("id-1", shared_drive_id: @shared_drive_id)
 
       assert request[:params][:fields] =~ "md5Checksum"
       assert request[:params][:fields] =~ "size"
@@ -331,6 +331,19 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert {:error, :missing_upload_session_url} = Drive.upload(unique_key(), "data", ctx)
     end
 
+    test "upload verifies against Drive's own reported md5Checksum", %{ctx: ctx} do
+      matching_ctx = %{ctx | expected_md5: Base.encode64(:erlang.md5("the real bytes"))}
+      assert {:ok, _} = Drive.upload(unique_key(), "the real bytes", matching_ctx)
+
+      mismatched_ctx = %{
+        ctx
+        | expected_md5: Base.encode64(:erlang.md5("something else entirely"))
+      }
+
+      assert {:error, :checksum_mismatch} =
+               Drive.upload(unique_key(), "the real bytes", mismatched_ctx)
+    end
+
     test "uploading a %File.Stream{} delivers identical bytes to uploading the equivalent binary",
          %{ctx: ctx} do
       content = :crypto.strong_rand_bytes(5_000)
@@ -431,6 +444,34 @@ defmodule AshStorage.Service.GoogleDriveTest do
       assert length(ids) == 2
     end
 
+    test ":folder_id actually scopes the lookup, not just the create request", %{ctx: ctx} do
+      folder_ctx = %{ctx | service_opts: Keyword.put(ctx.service_opts, :folder_id, "folder-1")}
+      key = unique_key()
+
+      assert {:ok, _} = Drive.upload(key, "in a folder", folder_ctx)
+
+      # A lookup scoped to the Shared Drive root (no :folder_id) must not
+      # find a file that was created under a different parent.
+      assert {:ok, false} = Drive.exists?(key, ctx)
+      assert {:ok, true} = Drive.exists?(key, folder_ctx)
+    end
+
+    test "a file trashed on Drive reports as not existing", %{
+      ctx: ctx,
+      server_state: server_state
+    } do
+      key = unique_key()
+      assert {:ok, %{service_opts: opts}} = Drive.upload(key, "will be trashed", ctx)
+      id = opts[:drive_file_id]
+
+      Agent.update(server_state, fn state ->
+        put_in(state, [:objects, id, :trashed], true)
+      end)
+
+      ctx_with_id = %{ctx | service_opts: Keyword.merge(ctx.service_opts, Map.to_list(opts))}
+      assert {:ok, false} = Drive.exists?(key, ctx_with_id)
+    end
+
     test "chunks concatenate to exactly what download/2 returns", %{ctx: ctx} do
       key = unique_key()
       content = :crypto.strong_rand_bytes(200_000)
@@ -483,10 +524,12 @@ defmodule AshStorage.Service.GoogleDriveTest do
 
     setup %{ctx: ctx} do
       # access_token is intentionally included here to prove it never
-      # reaches the persisted row -- only :shared_drive_id and the cached
-      # :drive_file_id should survive.
+      # reaches the persisted row -- only :shared_drive_id, :goth, and the
+      # cached :drive_file_id should survive.
+      opts = Keyword.put(ctx.service_opts, :goth, NoSuchGothServer)
+
       Application.put_env(:ash_storage, ConfigurablePost,
-        storage: [service: {AshStorage.Service.GoogleDrive, ctx.service_opts}]
+        storage: [service: {AshStorage.Service.GoogleDrive, opts}]
       )
 
       on_exit(fn -> Application.delete_env(:ash_storage, ConfigurablePost) end)
@@ -494,7 +537,7 @@ defmodule AshStorage.Service.GoogleDriveTest do
       :ok
     end
 
-    test "the blob row persists :drive_file_id and :shared_drive_id, never :access_token" do
+    test "the blob row persists :drive_file_id, :shared_drive_id and :goth, never :access_token" do
       post =
         ConfigurablePost
         |> Ash.Changeset.for_create(:create, %{title: "p"})
@@ -510,14 +553,26 @@ defmodule AshStorage.Service.GoogleDriveTest do
 
       assert row_opts["shared_drive_id"] == @shared_drive_id
       assert is_binary(row_opts["drive_file_id"])
+      # ConfigurablePost's blob resource is ETS-backed, so service_opts
+      # round-trips as native Elixir terms (the atom survives as-is); a
+      # jsonb-backed resource (Postgres) would store it as the string
+      # "Elixir.NoSuchGothServer" instead -- resolve_goth_name/1 handles
+      # both, see the `parsed_service_opts` assertion below for the form
+      # that matters (what a service call actually reads back).
+      assert row_opts["goth"] == NoSuchGothServer
       refute Map.has_key?(row_opts, "access_token")
+
+      # :goth round-trips as an atom through the persisted-then-reloaded
+      # path, not just on the freshly-created struct.
+      assert {:ok, reloaded} = Ash.load(blob, :parsed_service_opts)
+      assert reloaded.parsed_service_opts[:goth] == NoSuchGothServer
 
       # The dropped :access_token has a real, correctly-failing consequence:
       # a later call rebuilding its context purely from this row (download,
-      # purge, analysis) has no credential at all, since no :goth was
-      # configured either. It fails cleanly with :missing_credentials rather
-      # than succeeding on a token that was never supposed to persist.
-      assert {:error, :missing_credentials} = Operations.download(blob)
+      # purge, analysis) has no live credential -- :goth survived, but names
+      # a server that was never started, so it fails cleanly rather than
+      # succeeding on a token that was never supposed to persist.
+      assert {:error, {:goth_unavailable, _}} = Operations.download(blob)
     end
   end
 
@@ -745,7 +800,8 @@ defmodule AshStorage.Service.GoogleDriveTest do
           Jason.encode!(%{
             "id" => id,
             "size" => Integer.to_string(byte_size(body)),
-            "mimeType" => mime
+            "mimeType" => mime,
+            "md5Checksum" => md5
           })
 
         {200, response, [{"content-type", "application/json"}]}
@@ -753,12 +809,17 @@ defmodule AshStorage.Service.GoogleDriveTest do
   end
 
   defp list_files(server_state, query) do
-    name = extract_q_name(query["q"] || "")
+    q = query["q"] || ""
+    name = extract_q_field(q, "name")
+    parent = extract_q_field(q, "parent")
 
     files =
       Agent.get(server_state, fn state ->
         state.objects
-        |> Enum.filter(fn {_id, object} -> object.name == name and not object.trashed end)
+        |> Enum.filter(fn {_id, object} ->
+          object.name == name and not object.trashed and
+            (is_nil(parent) or parent in object.parents)
+        end)
         |> Enum.map(fn {id, object} ->
           %{
             "id" => id,
@@ -773,12 +834,21 @@ defmodule AshStorage.Service.GoogleDriveTest do
     {200, Jason.encode!(%{"files" => files}), [{"content-type", "application/json"}]}
   end
 
-  defp extract_q_name(q) do
+  defp extract_q_field(q, "name") do
     case Regex.run(~r/name = '((?:[^'\\]|\\.)*)'/, q) do
-      [_, name] -> name |> String.replace("\\'", "'") |> String.replace("\\\\", "\\")
+      [_, value] -> unescape_q(value)
       _ -> nil
     end
   end
+
+  defp extract_q_field(q, "parent") do
+    case Regex.run(~r/'((?:[^'\\]|\\.)*)' in parents/, q) do
+      [_, value] -> unescape_q(value)
+      _ -> nil
+    end
+  end
+
+  defp unescape_q(value), do: value |> String.replace("\\'", "'") |> String.replace("\\\\", "\\")
 
   defp get_file(server_state, id, query) do
     case Agent.get(server_state, fn state -> Map.fetch(state.objects, id) end) do
