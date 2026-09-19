@@ -276,6 +276,9 @@ AshStorage ships with:
 - `AshStorage.Service.Test` — In-memory storage for tests
 - `AshStorage.Service.S3` — S3-compatible storage (requires [`req_s3`](https://hex.pm/packages/req_s3))
 - `AshStorage.Service.AzureBlob` — Azure Blob Storage (requires [`req`](https://hex.pm/packages/req))
+- `AshStorage.Service.GoogleDrive` — Google Workspace Shared Drive (requires
+  [`req`](https://hex.pm/packages/req), and [`goth`](https://hex.pm/packages/goth)
+  unless you supply your own bearer token)
 - `AshStorage.Service.Mirror` — Composite service that fans uploads/deletes out across multiple child services for redundancy
 
 Implement the `AshStorage.Service` behaviour to add custom backends.
@@ -309,6 +312,37 @@ optional `c:AshStorage.Service.stream_download/2` callback — currently
 Test, Mirror) fall back to `download/2` and yield the whole body as a single
 chunk. No checksum verification happens on this path; use `download/2` when
 the blob's `:checksum` must be verified.
+
+### Google Drive
+
+`AshStorage.Service.GoogleDrive` writes to a Google Workspace Shared Drive
+through a service account, ported from a production Drive integration —
+its moduledoc covers eight setup rules that are easy to get wrong (Shared
+Drive membership, `supportsAllDrives`, Goth scopes and registration, and
+more).
+
+```elixir
+storage do
+  service {AshStorage.Service.GoogleDrive,
+    shared_drive_id: "0AB...",
+    goth: MyApp.Goth}
+end
+```
+
+A service account has no storage quota of its own — it must be added as a
+member (Content Manager or above) of a Workspace Shared Drive, or every
+upload fails as though credentials were wrong. `:goth` names an already-running
+`Goth` server whose scopes already include
+`https://www.googleapis.com/auth/drive`; a raw `:access_token` is also
+accepted per-call for callers that don't use Goth.
+
+Drive file URLs are not access-controlled, so `url/2` only returns something
+useful when `:base_url` is configured to point at your own proxy (see
+[Streaming downloads](#streaming-downloads) and `AshStorage.Plug.Proxy`) —
+otherwise it returns an unprotected `drive.google.com` link, clearly
+documented as such, or raises if there's nothing to build a URL from at all.
+`direct_upload/2` is not implemented; upload through `attach/4` or call
+`upload/3` directly.
 
 ### Mirroring across multiple backends
 
