@@ -49,6 +49,10 @@ bytes back to a client mid-response; a checksum-mismatch error after the
 body has begun would surface as a 502 with a partial body, worse than
 serving the bytes uncheckable.
 
+`AshStorage.Operations.stream_download/2` deliberately does not set
+`:expected_md5` either — a chunked body cannot be hashed before the caller
+has seen part of it, for the same reason the proxy plug doesn't verify.
+
 ## When `head/2` returns no usable checksum
 
 Two real-world cases produce a `head/2` response with `content_md5: nil`:

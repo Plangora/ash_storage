@@ -280,6 +280,36 @@ AshStorage ships with:
 
 Implement the `AshStorage.Service` behaviour to add custom backends.
 
+### Streaming downloads
+
+`AshStorage.Service.download/2` returns the whole object as one binary. For
+large files — proxying downloads through your own app, for instance — use
+`AshStorage.Operations.stream_download/2` instead, which returns an enumerable
+of binary chunks:
+
+```elixir
+{:ok, chunks} = AshStorage.Operations.stream_download(blob)
+
+conn
+|> Plug.Conn.put_resp_content_type("application/octet-stream")
+|> Plug.Conn.send_chunked(200)
+|> then(fn conn ->
+  Enum.reduce_while(chunks, conn, fn chunk, conn ->
+    case Plug.Conn.chunk(conn, chunk) do
+      {:ok, conn} -> {:cont, conn}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end)
+end)
+```
+
+Streaming is opt-in and only bounds memory for services that implement the
+optional `c:AshStorage.Service.stream_download/2` callback — currently
+`AshStorage.Service.Disk`. Services that don't implement it (S3, AzureBlob,
+Test, Mirror) fall back to `download/2` and yield the whole body as a single
+chunk. No checksum verification happens on this path; use `download/2` when
+the blob's `:checksum` must be verified.
+
 ### Mirroring across multiple backends
 
 `AshStorage.Service.Mirror` wraps an ordered list of child services. Writes (`upload`, `delete`) fan out sequentially across every child; reads (`download`, `exists?`) consult the primary first and fall through to secondaries on `:not_found`; `url/2` and `direct_upload/2` always go through the primary.
