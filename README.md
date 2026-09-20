@@ -308,10 +308,10 @@ end)
 
 Streaming is opt-in and only bounds memory for services that implement the
 optional `c:AshStorage.Service.stream_download/2` callback — currently
-`AshStorage.Service.Disk`. Services that don't implement it (S3, AzureBlob,
-Test, Mirror) fall back to `download/2` and yield the whole body as a single
-chunk. No checksum verification happens on this path; use `download/2` when
-the blob's `:checksum` must be verified.
+`AshStorage.Service.Disk` and `AshStorage.Service.GoogleDrive`. Services that
+don't implement it (S3, AzureBlob, Test, Mirror) fall back to `download/2`
+and yield the whole body as a single chunk. No checksum verification happens
+on this path; use `download/2` when the blob's `:checksum` must be verified.
 
 ### Google Drive
 
