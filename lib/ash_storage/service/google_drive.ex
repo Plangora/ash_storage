@@ -531,27 +531,33 @@ if Code.ensure_loaded?(Req) do
       ArgumentError -> name
     end
 
-    # Goth registers through its own Registry, not as a named process --
-    # Process.whereis/1 would report nil while Goth is running fine, so we
-    # never probe that way. An unstarted or misnamed server surfaces as an
-    # exit or an ArgumentError from the underlying {:via, Registry, _}
-    # lookup, not as {:error, _}, so both are caught here explicitly.
-    defp fetch_goth_token(name) do
-      case goth_module().fetch(name) do
-        {:ok, %{token: token}} -> {:ok, token}
-        {:error, reason} -> {:error, {:goth_error, reason}}
+    # Conditional on Goth being loaded, mirroring the Req gate this whole
+    # module is wrapped in -- :goth is an optional dependency, so an
+    # application without it must still compile this module cleanly (the
+    # :access_token path needs no Goth at all). Written as two real
+    # `defp fetch_goth_token/1` clauses behind a compile-time branch rather
+    # than a dynamically-produced module name, so the dependency on Goth is
+    # explicit and a `--warnings-as-errors` build only ever sees a live
+    # `Goth.fetch/1` reference when Goth is actually present.
+    if Code.ensure_loaded?(Goth) do
+      # Goth registers through its own Registry, not as a named process --
+      # Process.whereis/1 would report nil while Goth is running fine, so we
+      # never probe that way. An unstarted or misnamed server surfaces as an
+      # exit or an ArgumentError from the underlying {:via, Registry, _}
+      # lookup, not as {:error, _}, so both are caught here explicitly.
+      defp fetch_goth_token(name) do
+        case Goth.fetch(name) do
+          {:ok, %{token: token}} -> {:ok, token}
+          {:error, reason} -> {:error, {:goth_error, reason}}
+        end
+      rescue
+        e -> {:error, {:goth_unavailable, e}}
+      catch
+        :exit, reason -> {:error, {:goth_unavailable, reason}}
       end
-    rescue
-      e -> {:error, {:goth_unavailable, e}}
-    catch
-      :exit, reason -> {:error, {:goth_unavailable, reason}}
+    else
+      defp fetch_goth_token(_name), do: {:error, :goth_not_available}
     end
-
-    # Resolved at runtime rather than written as `Goth.fetch/1` so this module
-    # compiles cleanly in applications that don't depend on :goth at all --
-    # the :access_token path needs no Goth, and a literal remote call would
-    # emit an "undefined module" warning that fails --warnings-as-errors builds.
-    defp goth_module, do: Module.concat(["Goth"])
 
     # -- Id resolution --
 
